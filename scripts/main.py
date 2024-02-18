@@ -18,9 +18,14 @@ import time
 
 # 读取 csv 文件到内存中缓存起来
 def load_csv(csv_file):
+    cache = {}
     with open(csv_file, 'r', encoding='utf-8') as f:
         reader = csv.reader(f)
-        cache = dict(reader)
+        lines = dict(reader)
+        for key, value in lines.items():
+            tags = re.split(r'\s+|\|', key)
+            for tag in tags:
+                cache[tag] = value
     return cache
 
 # 加载 csv 文件并缓存到内存中
