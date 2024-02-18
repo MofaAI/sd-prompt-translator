@@ -5,14 +5,29 @@ import gradio as gr
 from modules.shared import opts
 from transformers import MarianMTModel, MarianTokenizer
 from transformers import MBart50TokenizerFast, MBartForConditionalGeneration
+from datetime import datetime
+import hashlib
+import hmac
+import json
+import requests
 import re
 import os
 import string
 import csv
 import time
 
+# 读取 csv 文件到内存中缓存起来
+def load_csv(csv_file):
+    with open(csv_file, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        cache = dict(reader)
+    return cache
+
+# 加载 csv 文件并缓存到内存中
+cache_csv = load_csv(os.path.join(os.path.dirname(__file__), 'translations.csv'))
 # The directory to store the models
 cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+
 # 中文转英文的翻译模型
 class ZhEnTranslator:
     def __init__(self, cache_dir=cache_dir, model_name="Helsinki-NLP/opus-mt-zh-en"):
@@ -234,28 +249,22 @@ def correct_translation_format(original_text, translated_text):
     corrected_parts = []
     for i, original_part in enumerate(original_parts):
         translated_part = translated_parts[i]
-        
         original_plus_count = original_part.count('+')
         translated_plus_count = translated_part.count('+')
         plus_difference = translated_plus_count - original_plus_count
-        
         if plus_difference > 0:
             translated_part = translated_part.replace('+' * plus_difference, '', 1)
         elif plus_difference < 0:
             translated_part += '+' * abs(plus_difference)
-        
         corrected_parts.append(translated_part)
-    
     corrected_text = '++'.join(corrected_parts)
     return corrected_text
 
 def extract_plus_positions(text):
     """
     Given a string of text, extracts the positions of all sequences of one or more '+' characters.
-    
     Args:
     - text (str): the input text
-    
     Returns:
     - positions (list of lists): a list of [start, end, count] for each match, where start is the index of the
       first '+' character, end is the index of the last '+' character + 1, and count is the number of '+' characters
@@ -280,7 +289,7 @@ def extract_plus_positions(text):
             positions.append([j, last_match_end, last_match_end - j])
 
         last_match_end = match.end()
-    
+
     # If the final match extends to the end of the string, add its position to the output list
     if last_match_end is not None and last_match_end == len(text):
         j = last_match_end - 1
@@ -296,20 +305,16 @@ def match_pluses(original_text, translated_text):
     """
     Given two strings of text, replaces sequences of '+' characters in the second string with the corresponding
     sequences of '+' characters in the first string.
-    
     Args:
     - original_text (str): the original text
     - translated_text (str): the translated text with '+' characters
-    
     Returns:
     - output (str): the translated text with '+' characters replaced by those in the original text
     """
     in_positions = extract_plus_positions(original_text)
     out_positions = extract_plus_positions(translated_text)    
-    
     out_vals = []
     out_current_pos = 0
-    
     if len(in_positions) == len(out_positions):
         # Iterate through the positions and replace the sequences of '+' characters in the translated text
         # with those in the original text
@@ -317,14 +322,14 @@ def match_pluses(original_text, translated_text):
             out_vals.append(translated_text[out_current_pos:out_[0]])
             out_vals.append(original_text[in_[0]:in_[1]])
             out_current_pos = out_[1]
-            
+
             # Check that the number of '+' characters in the original and translated sequences is the same
             if in_[2] != out_[2]:
                 print("detected different + count")
 
     # Add any remaining text from the translated string to the output
     out_vals.append(translated_text[out_current_pos:])
-    
+
     # Join the output values into a single string
     output = "".join(out_vals)
     return output
@@ -336,22 +341,103 @@ def post_process_prompt(original, translated):
     #clean_prompt = remove_extra_plus(clean_prompt)
     return clean_prompt  
 
-# 读取 csv 文件到内存中缓存起来
-def load_csv(csv_file):
-    with open(csv_file, 'r', encoding='utf-8') as f:
-        reader = csv.reader(f)
-        cache = dict(reader)
-    return cache
-
 # 自定义翻译函数
 def custom_translate(text, cache):
-    if text in cache:
-        return cache[text]
-    else:
+    translated = None
+    try:
+        if text in cache:
+            translated = cache[text]
+            print("cache_translate:", text, " > ", translated)
+        else:
+            translated = tencent_translate(text)
+            cache[text] = translated
+            print("tencent_translate:", text, " > ", translated)
+    finally:
+        return translated
+
+def tencent_translate(text):
+    params = {
+        'SourceText': text,
+        'Source': "zh",
+        'Target': "en",
+        'ProjectId': 0
+    }
+    region = "ap-shanghai"
+    secret_id = os.getenv("Tencent_SecretId")
+    secret_key = os.getenv("Tencent_SecretKey")
+    if not text or not secret_id or not secret_key:
         return None
+    res = sign_tencent(secret_id, secret_key, region, params)
+    response = requests.post(res['url'], json=params, timeout=10, headers=res['headers'])
+    result = response.json()
+    print(result)
+    if 'Response' not in result:
+        raise Exception(result)
+    if 'TargetText' not in result['Response']:
+        raise Exception(result)
+    return result['Response']['TargetText']
 
+def sign_tencent(secret_id, secret_key, regin, params, action="TextTranslate", version="2018-03-21"):
+    host = 'tmt.tencentcloudapi.com'
+    endpoint = "https://" + host
 
+    service = "tmt"
+    algorithm = "TC3-HMAC-SHA256"
+    timestamp = int(time.time())
+    date = datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d")
 
+    # ************* 步骤 1：拼接规范请求串 *************
+    http_request_method = "POST"
+    canonical_uri = "/"
+    canonical_querystring = ""
+    ct = "application/json; charset=utf-8"
+    payload = json.dumps(params)
+    canonical_headers = "content-type:%s\nhost:%s\nx-tc-action:%s\n" % (ct, host, action.lower())
+    signed_headers = "content-type;host;x-tc-action"
+    hashed_request_payload = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    canonical_request = (http_request_method + "\n" +
+                         canonical_uri + "\n" +
+                         canonical_querystring + "\n" +
+                         canonical_headers + "\n" +
+                         signed_headers + "\n" +
+                         hashed_request_payload)
+
+    # ************* 步骤 2：拼接待签名字符串 *************
+    credential_scope = date + "/" + service + "/" + "tc3_request"
+    hashed_canonical_request = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
+    string_to_sign = (algorithm + "\n" +
+                      str(timestamp) + "\n" +
+                      credential_scope + "\n" +
+                      hashed_canonical_request)
+
+    # ************* 步骤 3：计算签名 *************
+    # 计算签名摘要函数
+    def sign(key, msg):
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    secret_date = sign(("TC3" + secret_key).encode("utf-8"), date)
+    secret_service = sign(secret_date, service)
+    secret_signing = sign(secret_service, "tc3_request")
+    signature = hmac.new(secret_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    # ************* 步骤 4：拼接 Authorization *************
+    authorization = (algorithm + " " +
+                     "Credential=" + secret_id + "/" + credential_scope + ", " +
+                     "SignedHeaders=" + signed_headers + ", " +
+                     "Signature=" + signature)
+
+    return {
+        "url": endpoint,
+        "headers": {
+            "Authorization": authorization,
+            "Content-Type": ct,
+            "Host": host,
+            "X-TC-Action": action,
+            "X-TC-Timestamp": str(timestamp),
+            "X-TC-Version": version,
+            "X-TC-Region": regin,
+        },
+    }
 
 class Script(scripts.Script):
     def __init__(self) -> None:
@@ -368,7 +454,7 @@ class Script(scripts.Script):
     def show(self, is_img2img):
         """Returns the visibility status of the script in the interface."""
         return scripts.AlwaysVisible
-    
+
     def set_active(self, disable):
         """Sets the is_active attribute and initializes the translator object if not already created. 
         Also, sets the visibility of the language dropdown to True."""
@@ -455,7 +541,7 @@ class Script(scripts.Script):
 
     def process_text(self,text):
         # 将中文全角标点符号替换为半角标点符号
-        text = text.translate(str.maketrans('，。！？；：‘’“”（）【】', ',.!?;:\'\'\"\"()[]'))
+        text = text.translate(str.maketrans('，。！？；：‘’“”（）【】#', ',.!?;:\'\'\"\"()[],'))
         # 使用正则表达式来分割尖括号内外的内容
         parts = re.split(r'(<[^>]*>)', text)
 
@@ -479,11 +565,8 @@ class Script(scripts.Script):
 
     # 翻译函数
     def transfer(self,text):
-        # 加载 csv 文件并缓存到内存中
-        csv_path = os.path.join(os.path.dirname(__file__), 'translations.csv')
-        cache = load_csv(csv_path)
         # 自定义翻译
-        result = custom_translate(text, cache)
+        result = custom_translate(text, cache_csv)
         if result is not None:
             return result
         else:
